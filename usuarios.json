@@ -1,0 +1,96 @@
+{
+  "107292846489786@lid": {
+    "jaFalou": true,
+    "etapa": "reagendar_hora",
+    "agendamentosParaReagendar": [
+      {
+        "cliente": "107292846489786@lid",
+        "nome": "gustavo",
+        "profissional": "Carlos",
+        "servico": "Sobrancelha + Barba",
+        "data": "27/09",
+        "hora": "17:30"
+      }
+    ],
+    "agendamentoParaReagendar": {
+      "cliente": "107292846489786@lid",
+      "nome": "gustavo",
+      "profissional": "Carlos",
+      "servico": "Sobrancelha + Barba",
+      "data": "27/09",
+      "hora": "17:30"
+    },
+    "servico": {
+      "id": 4,
+      "nome": "Sobrancelha + Barba",
+      "preco": 30,
+      "duracao": 30
+    },
+    "profissional": {
+      "id": 2,
+      "nome": "Carlos"
+    },
+    "nome": "gustavo",
+    "data": "28/09",
+    "horariosDisponiveis": [
+      "08:00",
+      "08:30",
+      "09:00",
+      "09:30",
+      "10:00",
+      "10:30",
+      "11:00",
+      "11:30",
+      "13:30",
+      "14:00",
+      "14:30",
+      "15:00",
+      "15:30",
+      "16:00",
+      "16:30",
+      "17:00",
+      "17:30"
+    ],
+    "nomeWhatsApp": "ﾠﾠ⁩ﾠﾠ⁩ﾠﾠ⁩"
+  },
+  "120363424934976477@g.us": {
+    "jaFalou": true,
+    "nomeWhatsApp": "Guilherme"
+  },
+  "101864024633423@lid": {
+    "nomeWhatsApp": "Joao Henrique",
+    "jaFalou": true,
+    "etapa": "profissional",
+    "falarComHumano": true
+  },
+  "120363425178768476@g.us": {
+    "nomeWhatsApp": "Joao Henrique",
+    "jaFalou": true
+  },
+  "133200173129958@lid": {
+    "nomeWhatsApp": "Vitor Gabriel",
+    "jaFalou": true
+  },
+  "79684662468627@lid": {
+    "nomeWhatsApp": "Calebe",
+    "jaFalou": true,
+    "falarComHumano": true,
+    "pontosFidelidade": 1
+  },
+  "272662207135980@lid": {
+    "nomeWhatsApp": "Fernanda Amorim",
+    "falarComHumano": true
+  },
+  "99209567023176@lid": {
+    "nomeWhatsApp": "Cauã 🩸",
+    "jaFalou": true,
+    "falarComHumano": true
+  },
+  "199381089312840@lid": {
+    "nomeWhatsApp": "Zete",
+    "jaFalou": true
+  },
+  "71064629543110@lid": {
+    "nomeWhatsApp": "Kauan"
+  }
+}

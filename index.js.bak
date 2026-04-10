@@ -1,0 +1,950 @@
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const cron = require('node-cron');
+const express = require('express');
+const path = require('path');
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const STARTUP_TIME = Math.floor(Date.now() / 1000);
+const NUMERO_ADMIN = "5544988601067";
+const LINK_AGENDAMENTO = "https://wa.me/5544988601067?text=menu";
+const WEB_PORT = 3000;
+
+// ── INFORMAÇÕES DA BARBEARIA ──────────────────────────────────────────────────
+const ENDERECO_BARBEARIA = "Rua Exemplo, 123 - Centro, Maringá - PR";
+const LINK_MAPS = "https://maps.app.goo.gl/example";
+const HORARIO_FUNCIONAMENTO = `🗓 *HORÁRIO DE ATENDIMENTO*
+
+━━━━━━━━━━━━━━━━━━
+Segunda a Sexta: 08:00 às 18:00
+Sábado: 08:00 às 16:00
+Domingo: Fechado
+━━━━━━━━━━━━━━━━━━`;
+
+const DIAS_PARA_RETORNO = 30; // Dias após o último corte para enviar lembrete
+const PONTOS_PARA_PREMIO = 10; // Cortes necessários para ganhar um grátis
+
+const atendentes = ["5544988601067@c.us"];
+
+const profissionais = [
+    { id: 1, nome: "João" },
+    { id: 2, nome: "Carlos" }
+];
+
+// ── ARQUIVOS ──────────────────────────────────────────────────────────────────
+function initFile(filePath, def) {
+    if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, JSON.stringify(def, null, 2));
+}
+
+initFile('./agendamentos.json', []);
+initFile('./bloqueios.json', []);
+initFile('./usuarios.json', {});
+
+const services = JSON.parse(fs.readFileSync('./services.json', 'utf8'));
+
+// ── HELPERS DE LEITURA/ESCRITA ────────────────────────────────────────────────
+function lerAgendamentos() { return JSON.parse(fs.readFileSync('./agendamentos.json', 'utf8')); }
+function salvarAgendamentos(l) { fs.writeFileSync('./agendamentos.json', JSON.stringify(l, null, 2)); }
+function lerBloqueios() { return JSON.parse(fs.readFileSync('./bloqueios.json', 'utf8')); }
+function salvarBloqueios(l) { fs.writeFileSync('./bloqueios.json', JSON.stringify(l, null, 2)); }
+function lerUsuarios() { return JSON.parse(fs.readFileSync('./usuarios.json', 'utf8')); }
+function salvarUsuarios(u) { fs.writeFileSync('./usuarios.json', JSON.stringify(u, null, 2)); }
+
+let usuarios = lerUsuarios();
+function salvarEstado() { salvarUsuarios(usuarios); }
+
+// ── HORÁRIOS (intervalos de 30min) ────────────────────────────────────────────
+function gerarTodosHorarios() {
+    let horarios = [];
+    for (let h = 8; h < 18; h++) {
+        for (let m = 0; m < 60; m += 30) {
+            if (h === 12 || (h === 13 && m === 0)) continue;
+            horarios.push(`${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`);
+        }
+    }
+    return horarios;
+}
+
+function horaParaMinutos(hora) {
+    const [h, m] = hora.split(':').map(Number);
+    return h * 60 + m;
+}
+
+function minutosParaHora(min) {
+    return `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+}
+
+function getSlotsOcupados(data, profissional) {
+    const lista = lerAgendamentos();
+    const bloqueios = lerBloqueios();
+    const ocupados = new Set();
+
+    for (let ag of lista) {
+        if (ag.data !== data || ag.profissional !== profissional) continue;
+        const serv = services.find(s => s.nome === ag.servico);
+        const slots = Math.ceil((serv ? serv.duracao : 30) / 30);
+        const inicio = horaParaMinutos(ag.hora);
+        for (let i = 0; i < slots; i++) ocupados.add(minutosParaHora(inicio + i * 30));
+    }
+
+    for (let bl of bloqueios) {
+        if (bl.data !== data || bl.profissional !== profissional) continue;
+        ocupados.add(bl.hora);
+    }
+
+    return ocupados;
+}
+
+function getHorariosDisponiveis(data, profissional, duracaoServico) {
+    const todos = gerarTodosHorarios();
+    const ocupados = getSlotsOcupados(data, profissional);
+    const slots = Math.ceil(duracaoServico / 30);
+
+    return todos.filter(hora => {
+        for (let i = 0; i < slots; i++) {
+            const slot = minutosParaHora(horaParaMinutos(hora) + i * 30);
+            if (ocupados.has(slot) || !todos.includes(slot)) return false;
+        }
+        return true;
+    });
+}
+
+// ── VALIDAÇÃO ─────────────────────────────────────────────────────────────────
+function validarDataFutura(data) {
+    const match = data.match(/^(0[1-9]|[12][0-9]|3[01])\/(0[1-9]|1[0-2])$/);
+    if (!match) return false;
+    const [dia, mes] = data.split('/').map(Number);
+    const agora = new Date();
+    const dataInformada = new Date(agora.getFullYear(), mes - 1, dia, 23, 59, 59);
+    if (dataInformada < agora) {
+        const proxAno = new Date(agora.getFullYear() + 1, mes - 1, dia, 23, 59, 59);
+        return proxAno >= agora;
+    }
+    return true;
+}
+
+// ── NOTIFICAÇÕES ──────────────────────────────────────────────────────────────
+async function enviarNotificacao(tipo, dados) {
+    try {
+        const numero = await client.getNumberId(NUMERO_ADMIN);
+        if (!numero?._serialized) return;
+        let msg = "";
+        if (tipo === "novo") {
+            msg = `📢 *NOVO AGENDAMENTO*\n\n━━━━━━━━━━━━━━━━━━\n\n👤 ${dados.nome}\n📞 ${dados.telefone}\n\n💇 ${dados.servico}\n👨‍🔧 ${dados.profissional}\n\n📅 ${dados.data}\n⏰ ${dados.hora}\n\n━━━━━━━━━━━━━━━━━━`;
+        } else if (tipo === "confirmado_cliente") {
+            msg = `✅ *CLIENTE CONFIRMOU PRESENÇA*\n\n👤 ${dados.nome}\n📅 ${dados.data}\n⏰ ${dados.hora}`;
+        } else if (tipo === "cancelado_cliente") {
+            msg = `❌ *CLIENTE NÃO VAI COMPARECER*\n\n👤 ${dados.nome}\n📅 ${dados.data}\n⏰ ${dados.hora}`;
+        } else if (tipo === "humano") {
+            msg = `🙋‍♂️ *SOLICITAÇÃO DE ATENDIMENTO HUMANO*\n\n👤 ${dados.nome || 'Cliente'}\n📞 ${dados.telefone}\n\nO cliente deseja falar com você. A IA foi desativada para esta conversa.`;
+        } else if (tipo === "critica") {
+            msg = `⚠️ *FEEDBACK NEGATIVO RECEBIDO* ⚠️\n\n👤 ${dados.nome || 'Cliente'}\n📞 ${dados.telefone}\n\nO cliente deu uma nota *${dados.nota}* na pesquisa de satisfação. É importante entrar em contato para entender o ocorrido.`;
+        }
+        await client.sendMessage(numero._serialized, msg);
+    } catch (e) {
+        console.log(e.message);
+    }
+}
+
+// ── LEMBRETE (a cada 1 min) ───────────────────────────────────────────────────
+setInterval(async () => {
+    const lista = lerAgendamentos();
+    const agora = new Date();
+    let alterado = false;
+
+    for (let ag of lista) {
+        if (ag.lembreteEnviado) continue;
+        const [dia, mes] = ag.data.split('/');
+        const [hora] = ag.hora.split(':');
+        const dataAg = new Date(agora.getFullYear(), mes - 1, dia, hora);
+        const diff = (dataAg - agora) / (1000 * 60);
+
+        if (diff <= 60 && diff > 0) {
+            await client.sendMessage(ag.cliente,
+`⏰ *LEMBRETE DE AGENDAMENTO*
+
+━━━━━━━━━━━━━━━━━━
+
+👤 ${ag.nome}
+💇 ${ag.servico}
+
+📅 ${ag.data}
+⏰ ${ag.hora}
+
+━━━━━━━━━━━━━━━━━━
+
+Você confirma sua presença?
+
+1️⃣ Sim  
+2️⃣ Não`);
+            ag.lembreteEnviado = true;
+            alterado = true;
+        }
+    }
+
+    if (alterado) salvarAgendamentos(lista);
+}, 60000);
+
+// ── LIMPEZA AUTOMÁTICA E FIDELIDADE ───────────────────────────────────────────
+setInterval(() => {
+    const lista = lerAgendamentos();
+    const agora = new Date();
+    let alterado = false;
+
+    const novaLista = lista.filter(ag => {
+        const [dia, mes] = ag.data.split('/').map(Number);
+        const [hora] = ag.hora.split(':').map(Number);
+        const dataAg = new Date(agora.getFullYear(), mes - 1, dia, hora);
+        
+        // Se o agendamento já passou
+        if (dataAg <= agora) {
+            // Se ainda não demos o ponto de fidelidade por este agendamento
+            if (!ag.fidelidadeProcessada) {
+                const user = usuarios[ag.cliente] || {};
+                user.pontosFidelidade = (user.pontosFidelidade || 0) + 1;
+                ag.fidelidadeProcessada = true;
+                alterado = true;
+                
+                // Notifica o cliente do ponto ganho
+                client.sendMessage(ag.cliente, 
+`✨ *Ponto de Fidelidade Adicionado!* ✨
+
+Você acaba de ganhar +1 ponto no seu cartão fidelidade da *Barbearia do Kauan*! 🏆
+
+📊 *Seu progresso:* ${user.pontosFidelidade}/${PONTOS_PARA_PREMIO}
+${user.pontosFidelidade >= PONTOS_PARA_PREMIO ? "🎉 *PARABÉNS! Seu próximo corte é por nossa conta!*" : `Faltam apenas ${PONTOS_PARA_PREMIO - user.pontosFidelidade} para o seu prêmio!`}`).catch(() => {});
+            }
+            
+            // Processamento de Pesquisa de Satisfação
+            if (!ag.pesquisaEnviada) {
+                const diffHoras = (agora - dataAg) / (1000 * 60 * 60);
+                if (diffHoras >= 2) { // Envia 2 horas após o corte
+                    client.sendMessage(ag.cliente, 
+`⭐ *PESQUISA DE SATISFAÇÃO* ⭐
+
+Olá! Como foi sua experiência na *Barbearia do Kauan* hoje?
+
+Sua opinião é muito importante para nós! Por favor, responda com uma nota de *1 a 5*:
+
+⭐ *1* - Muito Ruim
+⭐ *2* - Ruim
+⭐ *3* - Regular
+⭐ *4* - Bom
+⭐ *5* - Excelente!`).catch(() => {});
+                    ag.pesquisaEnviada = true;
+                    alterado = true;
+                }
+            }
+
+            // Remove da lista ativa após 5 horas do horário agendado (mais tempo para a pesquisa)
+            const diffHorasFinal = (agora - dataAg) / (1000 * 60 * 60);
+            return diffHorasFinal < 5; 
+        }
+        return true;
+    });
+
+    if (alterado || novaLista.length !== lista.length) {
+        salvarAgendamentos(novaLista);
+        salvarEstado();
+        console.log("🧹 Limpeza e fidelidade processadas");
+    }
+}, 60000);
+
+// ── RELATÓRIO DIÁRIO (todo dia às 07:00) ──────────────────────────────────────
+cron.schedule('0 7 * * *', async () => {
+    try {
+        const lista = lerAgendamentos();
+        const agora = new Date();
+        const hoje = `${String(agora.getDate()).padStart(2, '0')}/${String(agora.getMonth() + 1).padStart(2, '0')}`;
+        const agHoje = lista.filter(a => a.data === hoje).sort((a, b) => a.hora.localeCompare(b.hora));
+        const numero = await client.getNumberId(NUMERO_ADMIN);
+        if (!numero?._serialized) return;
+
+        if (!agHoje.length) {
+            return client.sendMessage(numero._serialized, `📅 *AGENDA DE HOJE (${hoje})*\n\nNenhum agendamento para hoje.`);
+        }
+
+        let msg = `📅 *AGENDA DE HOJE (${hoje})*\n\n━━━━━━━━━━━━━━━━━━\n\n`;
+        agHoje.forEach((ag, i) => {
+            msg += `${i + 1}. ⏰ ${ag.hora} — *${ag.nome}*\n   💇 ${ag.servico} | 👨‍🔧 ${ag.profissional}\n\n`;
+        });
+        msg += `━━━━━━━━━━━━━━━━━━\nTotal: ${agHoje.length} agendamento(s)`;
+        client.sendMessage(numero._serialized, msg);
+    } catch (e) {
+        console.log("Erro relatório diário:", e.message);
+    }
+});
+
+// ── LEMBRETE DE RETORNO (todo dia às 10:00) ──────────────────────────────────
+cron.schedule('0 10 * * *', async () => {
+    try {
+        const agendamentos = lerAgendamentos();
+        const agora = new Date();
+        const hojeTimestamp = agora.getTime();
+
+        // Agrupar último agendamento por cliente
+        const ultimoPorCliente = {};
+        agendamentos.forEach(ag => {
+            const [dia, mes] = ag.data.split('/').map(Number);
+            const dataAg = new Date(agora.getFullYear(), mes - 1, dia);
+            const timestamp = dataAg.getTime();
+
+            if (!ultimoPorCliente[ag.cliente] || timestamp > ultimoPorCliente[ag.cliente].timestamp) {
+                ultimoPorCliente[ag.cliente] = { ...ag, timestamp };
+            }
+        });
+
+        for (const clienteId in ultimoPorCliente) {
+            const ultimo = ultimoPorCliente[clienteId];
+            const diffDias = Math.floor((hojeTimestamp - ultimo.timestamp) / (1000 * 60 * 60 * 24));
+
+            if (diffDias === DIAS_PARA_RETORNO) {
+                const user = usuarios[clienteId] || {};
+                const nome = user.nomeWhatsApp || ultimo.nome || "Amigo(a)";
+                
+                await client.sendMessage(clienteId, 
+`Olá, *${nome}*! Tudo bem? 💈✨
+
+Já faz um mês desde o seu último corte na *Barbearia do Kauan*! ✂️🔥
+
+Passando para lembrar que manter o visual em dia renova a autoestima e garante aquele estilo impecável. 
+
+⚡ *Temos horários disponíveis para essa semana!*
+
+👉 Digite *menu* para agendar agora e garantir seu lugar! 👇`);
+                console.log(`📩 Lembrete de retorno enviado para: ${nome} (${clienteId})`);
+            }
+        }
+    } catch (e) {
+        console.log("Erro lembrete de retorno:", e.message);
+    }
+});
+
+// ── PAINEL WEB ────────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/agendamentos', (req, res) => res.json(lerAgendamentos()));
+app.get('/api/bloqueios', (req, res) => res.json(lerBloqueios()));
+app.get('/api/profissionais', (req, res) => res.json(profissionais));
+app.get('/api/horarios', (req, res) => res.json(gerarTodosHorarios()));
+
+app.delete('/api/agendamentos/:idx', (req, res) => {
+    const lista = lerAgendamentos();
+    const idx = parseInt(req.params.idx);
+    if (idx < 0 || idx >= lista.length) return res.status(404).json({ error: 'Não encontrado' });
+    const removido = lista.splice(idx, 1)[0];
+    salvarAgendamentos(lista);
+    client.sendMessage(removido.cliente,
+        `❌ *Seu agendamento foi cancelado pela barbearia*\n\n📅 ${removido.data} ⏰ ${removido.hora}\n\nPara reagendar, digite *menu*`
+    ).catch(() => {});
+    res.json({ ok: true });
+});
+
+app.post('/api/bloqueios', (req, res) => {
+    const { data, hora, profissional, motivo } = req.body;
+    if (!data || !hora || !profissional) return res.status(400).json({ error: 'Dados incompletos' });
+    const bl = lerBloqueios();
+    bl.push({ data, hora, profissional, motivo: motivo || '' });
+    salvarBloqueios(bl);
+    res.json({ ok: true });
+});
+
+app.delete('/api/bloqueios/:idx', (req, res) => {
+    const bl = lerBloqueios();
+    const idx = parseInt(req.params.idx);
+    if (idx < 0 || idx >= bl.length) return res.status(404).json({ error: 'Não encontrado' });
+    bl.splice(idx, 1);
+    salvarBloqueios(bl);
+    res.json({ ok: true });
+});
+
+app.listen(WEB_PORT, () => console.log(`🌐 Painel web: http://localhost:${WEB_PORT}`));
+
+// ── CLIENTE WHATSAPP ──────────────────────────────────────────────────────────
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: { headless: true, args: ['--no-sandbox'] }
+});
+
+// ── COMANDOS ADMIN ────────────────────────────────────────────────────────────
+async function handleAdminCommand(from, texto) {
+    const lista = lerAgendamentos();
+    const agora = new Date();
+    const hoje = `${String(agora.getDate()).padStart(2, '0')}/${String(agora.getMonth() + 1).padStart(2, '0')}`;
+
+    if (texto === 'admin' || texto === 'ajuda admin') {
+        return client.sendMessage(from,
+`🔧 *COMANDOS ADMIN*
+
+━━━━━━━━━━━━━━━━━━
+
+📋 *lista hoje*
+📋 *lista amanhã*
+📋 *lista DD/MM*
+❌ *cancelar [nome]*
+🚫 *bloquear DD/MM HH:MM Profissional*
+🙋‍♂️ *lista humano* — ver quem quer falar com humano
+🤖 *ativar ia [telefone]* — reativar IA para um número
+🌐 *Painel web:* http://localhost:${WEB_PORT}
+
+━━━━━━━━━━━━━━━━━━`);
+    }
+
+    if (texto === 'lista humano') {
+        const fila = Object.keys(usuarios).filter(u => usuarios[u].falarComHumano);
+        if (!fila.length) return client.sendMessage(from, `✅ Ninguém aguardando atendimento humano no momento.`);
+        let msg = `🙋‍♂️ *AGUARDANDO ATENDIMENTO HUMANO*\n\n`;
+        fila.forEach((u, i) => {
+            const user = usuarios[u];
+            msg += `${i + 1}. 📞 ${u.replace('@c.us', '')} ${user.nome ? `— *${user.nome}*` : ''}\n`;
+        });
+        return client.sendMessage(from, msg);
+    }
+
+    const matchAtivarIA = texto.match(/^ativar ia (\d+)$/);
+    if (matchAtivarIA) {
+        const tel = matchAtivarIA[1] + '@c.us';
+        if (usuarios[tel]) {
+            delete usuarios[tel].falarComHumano;
+            salvarEstado();
+            client.sendMessage(tel, `🤖 *O atendimento automático foi reativado por um administrador.*`).catch(() => {});
+            return client.sendMessage(from, `✅ IA reativada para ${matchAtivarIA[1]}`);
+        }
+        return client.sendMessage(from, `❌ Usuário ${matchAtivarIA[1]} não encontrado.`);
+    }
+
+    if (texto === 'lista hoje') {
+        const ag = lista.filter(a => a.data === hoje).sort((a, b) => a.hora.localeCompare(b.hora));
+        if (!ag.length) return client.sendMessage(from, `📅 Nenhum agendamento hoje (${hoje})`);
+        let msg = `📅 *AGENDA DE HOJE (${hoje})*\n\n`;
+        ag.forEach((a, i) => { msg += `${i + 1}. ⏰ ${a.hora} — *${a.nome}*\n   💇 ${a.servico} | 👨‍🔧 ${a.profissional}\n\n`; });
+        return client.sendMessage(from, msg);
+    }
+
+    if (texto === 'lista amanha' || texto === 'lista amanhã') {
+        const am = new Date(agora);
+        am.setDate(am.getDate() + 1);
+        const dataAm = `${String(am.getDate()).padStart(2, '0')}/${String(am.getMonth() + 1).padStart(2, '0')}`;
+        const ag = lista.filter(a => a.data === dataAm).sort((a, b) => a.hora.localeCompare(b.hora));
+        if (!ag.length) return client.sendMessage(from, `📅 Nenhum agendamento amanhã (${dataAm})`);
+        let msg = `📅 *AGENDA DE AMANHÃ (${dataAm})*\n\n`;
+        ag.forEach((a, i) => { msg += `${i + 1}. ⏰ ${a.hora} — *${a.nome}*\n   💇 ${a.servico} | 👨‍🔧 ${a.profissional}\n\n`; });
+        return client.sendMessage(from, msg);
+    }
+
+    const matchLista = texto.match(/^lista (\d{2}\/\d{2})$/);
+    if (matchLista) {
+        const data = matchLista[1];
+        const ag = lista.filter(a => a.data === data).sort((a, b) => a.hora.localeCompare(b.hora));
+        if (!ag.length) return client.sendMessage(from, `📅 Nenhum agendamento em ${data}`);
+        let msg = `📅 *AGENDA DE ${data}*\n\n`;
+        ag.forEach((a, i) => { msg += `${i + 1}. ⏰ ${a.hora} — *${a.nome}*\n   💇 ${a.servico} | 👨‍🔧 ${a.profissional}\n\n`; });
+        return client.sendMessage(from, msg);
+    }
+
+    const matchCancelar = texto.match(/^cancelar (.+)$/);
+    if (matchCancelar) {
+        const busca = matchCancelar[1].toLowerCase();
+        const futuros = lista.filter(a => {
+            const [dia, mes] = a.data.split('/').map(Number);
+            const [h] = a.hora.split(':').map(Number);
+            return new Date(agora.getFullYear(), mes - 1, dia, h) > agora && a.nome.toLowerCase().includes(busca);
+        });
+        if (!futuros.length) return client.sendMessage(from, `❌ Nenhum agendamento encontrado para "${matchCancelar[1]}"`);
+        if (futuros.length === 1) {
+            const ag = futuros[0];
+            salvarAgendamentos(lista.filter(a => !(a.cliente === ag.cliente && a.data === ag.data && a.hora === ag.hora)));
+            client.sendMessage(ag.cliente, `❌ *Seu agendamento foi cancelado pela barbearia*\n\n📅 ${ag.data} ⏰ ${ag.hora}\n\nPara reagendar, digite *menu*`).catch(() => {});
+            return client.sendMessage(from, `✅ Agendamento de *${ag.nome}* (${ag.data} ${ag.hora}) cancelado.`);
+        }
+        let msg = `🔍 Encontrados ${futuros.length} para "${matchCancelar[1]}":\n\n`;
+        futuros.forEach((a, i) => { msg += `${i + 1}. ${a.nome} — ${a.data} ${a.hora} (${a.profissional})\n`; });
+        msg += `\nResponda com o número para cancelar`;
+        usuarios[from] = { etapaAdmin: 'cancelar_escolha', agendamentosAdmin: futuros };
+        salvarEstado();
+        return client.sendMessage(from, msg);
+    }
+
+    const matchBloquear = texto.match(/^bloquear (\d{2}\/\d{2}) (\d{2}:\d{2}) (.+)$/);
+    if (matchBloquear) {
+        const [_, data, hora, profissional] = matchBloquear;
+        const bl = lerBloqueios();
+        bl.push({ data, hora, profissional, motivo: 'Admin' });
+        salvarBloqueios(bl);
+        return client.sendMessage(from, `✅ Horário ${hora} de ${data} bloqueado para *${profissional}*`);
+    }
+
+    return null;
+}
+
+// ── MENSAGENS ─────────────────────────────────────────────────────────────────
+client.on('message', async msg => {
+    if (!msg.body || msg.fromMe) return;
+    if (msg.timestamp < STARTUP_TIME) return; // Ignora mensagens enviadas antes do bot ligar
+
+    const from = msg.from;
+    const contact = await msg.getContact();
+    const nomeWhatsApp = contact.pushname || "Amigo(a)";
+    const texto = msg.body.toLowerCase().trim();
+
+    if (!usuarios[from]) usuarios[from] = { nomeWhatsApp };
+    let user = usuarios[from];
+    if (!user.nomeWhatsApp) user.nomeWhatsApp = nomeWhatsApp; // Garante que tenha o nome salvo
+
+    const isAdmin = atendentes.includes(from);
+
+    // Se o usuário quiser falar com um humano
+    if (texto === 'quero falar com um humano' && !isAdmin) {
+        user.falarComHumano = true;
+        salvarEstado();
+        await enviarNotificacao("humano", { nome: user.nome, telefone: from.replace('@c.us', '') });
+        return client.sendMessage(from, `🔔 *Solicitação enviada!*\n\nUm atendente humano foi notificado e entrará em contato em breve. A IA foi desativada para esta conversa.\n\nPara voltar ao atendimento automático, digite *ativar ia*`);
+    }
+
+    // Se a IA estiver desativada para este usuário, ignorar (a menos que seja comando de reativação ou admin)
+    if (user.falarComHumano && texto !== 'ativar ia' && !isAdmin) {
+        return;
+    }
+
+    // Se o usuário quiser reativar a IA
+    if (texto === 'ativar ia' && !isAdmin) {
+        delete user.falarComHumano;
+        salvarEstado();
+        return client.sendMessage(from, `🤖 *Atendimento automático reativado!*\n\nComo posso te ajudar hoje? Digite *menu* para agendar.`);
+    }
+
+    // ADMIN
+    if (isAdmin) {
+        if (user.etapaAdmin === 'cancelar_escolha') {
+            const idx = parseInt(texto) - 1;
+            const lista = lerAgendamentos();
+            const futuros = user.agendamentosAdmin;
+            if (isNaN(idx) || idx < 0 || idx >= futuros.length) return client.sendMessage(from, '❌ Opção inválida');
+            const ag = futuros[idx];
+            salvarAgendamentos(lista.filter(a => !(a.cliente === ag.cliente && a.data === ag.data && a.hora === ag.hora)));
+            client.sendMessage(ag.cliente, `❌ *Seu agendamento foi cancelado pela barbearia*\n\n📅 ${ag.data} ⏰ ${ag.hora}\n\nPara reagendar, digite *menu*`).catch(() => {});
+            delete user.etapaAdmin;
+            delete user.agendamentosAdmin;
+            salvarEstado();
+            return client.sendMessage(from, `✅ Agendamento de *${ag.nome}* cancelado.`);
+        }
+        await handleAdminCommand(from, texto);
+        return;
+    }
+
+    const lista = lerAgendamentos();
+
+    // RESPOSTA AO LEMBRETE
+    const agLembrete = lista.find(a => a.cliente === from && a.lembreteEnviado && !a.confirmado);
+    if (agLembrete && (texto === '1' || texto === '2')) {
+        agLembrete.confirmado = true;
+        salvarAgendamentos(lista);
+        if (texto === '1') {
+            await enviarNotificacao("confirmado_cliente", agLembrete);
+            return client.sendMessage(from, `✅ *Presença confirmada!*\n\nPerfeito, te esperamos 💈`);
+        } else {
+            await enviarNotificacao("cancelado_cliente", agLembrete);
+            salvarAgendamentos(lista.filter(a => a !== agLembrete));
+            return client.sendMessage(from, `❌ *Agendamento cancelado*\n\nSe quiser reagendar, digite *menu*`);
+        }
+    }
+
+    // CANCELAR (sair do fluxo)
+    if (texto === 'cancelar') {
+        delete usuarios[from];
+        usuarios[from] = {};
+        salvarEstado();
+        return client.sendMessage(from, `❌ Operação cancelada.\n\nDigite *menu* para começar novamente.`);
+    }
+
+    // MEUS AGENDAMENTOS
+    if (texto === 'meus agendamentos' || texto === 'meus horarios' || texto === 'meus horários') {
+        const agora = new Date();
+        const meus = lista.filter(a => {
+            if (a.cliente !== from) return false;
+            const [dia, mes] = a.data.split('/').map(Number);
+            const [h] = a.hora.split(':').map(Number);
+            return new Date(agora.getFullYear(), mes - 1, dia, h) > agora;
+        });
+        if (!meus.length) return client.sendMessage(from, `ℹ️ Você não tem agendamentos futuros.\n\nDigite *menu* para agendar.`);
+        let msg = `📋 *SEUS AGENDAMENTOS*\n\n`;
+        meus.forEach((a, i) => { msg += `${i + 1}. 📅 ${a.data} ⏰ ${a.hora}\n   💇 ${a.servico} | 👨‍🔧 ${a.profissional}\n\n`; });
+        msg += `Digite *cancelar agendamento* para cancelar\nDigite *reagendar* para remarcar`;
+        return client.sendMessage(from, msg);
+    }
+
+    // CANCELAR AGENDAMENTO (cliente escolhe qual)
+    if (texto === 'cancelar agendamento' || texto === 'cancelar meu agendamento') {
+        const agora = new Date();
+        const meus = lista.filter(a => {
+            if (a.cliente !== from) return false;
+            const [dia, mes] = a.data.split('/').map(Number);
+            const [h] = a.hora.split(':').map(Number);
+            return new Date(agora.getFullYear(), mes - 1, dia, h) > agora;
+        });
+        if (!meus.length) return client.sendMessage(from, `ℹ️ Você não tem agendamentos futuros.\n\nDigite *menu* para agendar.`);
+        let msg = `📋 *CANCELAR AGENDAMENTO*\n\nQual deseja cancelar?\n\n`;
+        meus.forEach((a, i) => { msg += `${i + 1}. 📅 ${a.data} ⏰ ${a.hora} — ${a.servico} (${a.profissional})\n`; });
+        msg += `\n0. Voltar`;
+        user.etapa = 'cancelar_escolha';
+        user.agendamentosParaCancelar = meus;
+        salvarEstado();
+        return client.sendMessage(from, msg);
+    }
+
+    // REAGENDAR
+    if (texto === 'reagendar') {
+        const agora = new Date();
+        const meus = lista.filter(a => {
+            if (a.cliente !== from) return false;
+            const [dia, mes] = a.data.split('/').map(Number);
+            const [h] = a.hora.split(':').map(Number);
+            return new Date(agora.getFullYear(), mes - 1, dia, h) > agora;
+        });
+        if (!meus.length) return client.sendMessage(from, `ℹ️ Você não tem agendamentos futuros.\n\nDigite *menu* para fazer um novo agendamento.`);
+        let msg = `🔄 *REAGENDAMENTO*\n\nQual agendamento deseja remarcar?\n\n`;
+        meus.forEach((a, i) => { msg += `${i + 1}. 📅 ${a.data} ⏰ ${a.hora} — ${a.servico} (${a.profissional})\n`; });
+        msg += `\n0. Cancelar`;
+        user.etapa = 'reagendar_escolha';
+        user.agendamentosParaReagendar = meus;
+        salvarEstado();
+        return client.sendMessage(from, msg);
+    }
+
+    // FLUXO: CANCELAR ESCOLHA (cliente)
+    if (user.etapa === 'cancelar_escolha') {
+        if (texto === '0') {
+            delete user.etapa;
+            delete user.agendamentosParaCancelar;
+            salvarEstado();
+            return client.sendMessage(from, `↩️ Operação cancelada.`);
+        }
+        const idx = parseInt(texto) - 1;
+        const meus = user.agendamentosParaCancelar;
+        if (isNaN(idx) || idx < 0 || idx >= meus.length) return client.sendMessage(from, '❌ Opção inválida. Escolha um número da lista.');
+        const agRemover = meus[idx];
+        salvarAgendamentos(lista.filter(a => !(a.cliente === agRemover.cliente && a.data === agRemover.data && a.hora === agRemover.hora)));
+        await enviarNotificacao("cancelado_cliente", agRemover);
+        delete user.etapa;
+        delete user.agendamentosParaCancelar;
+        salvarEstado();
+        return client.sendMessage(from, `✅ *Agendamento cancelado!*\n\n📅 ${agRemover.data} ⏰ ${agRemover.hora}\n\nDigite *menu* para fazer um novo agendamento.`);
+    }
+
+    // FLUXO: REAGENDAR — ESCOLHA
+    if (user.etapa === 'reagendar_escolha') {
+        if (texto === '0') {
+            delete user.etapa;
+            delete user.agendamentosParaReagendar;
+            salvarEstado();
+            return client.sendMessage(from, `↩️ Operação cancelada.`);
+        }
+        const idx = parseInt(texto) - 1;
+        const meus = user.agendamentosParaReagendar;
+        if (isNaN(idx) || idx < 0 || idx >= meus.length) return client.sendMessage(from, '❌ Opção inválida.');
+        const ag = meus[idx];
+        user.agendamentoParaReagendar = ag;
+        user.servico = services.find(s => s.nome === ag.servico);
+        user.profissional = profissionais.find(p => p.nome === ag.profissional);
+        user.nome = ag.nome;
+        user.etapa = 'reagendar_data';
+        salvarEstado();
+        return client.sendMessage(from, `📅 *REAGENDAMENTO*\n\n━━━━━━━━━━━━━━━━━━\nDigite a nova data (ex: 25/03):`);
+    }
+
+    // FLUXO: REAGENDAR — DATA
+    if (user.etapa === 'reagendar_data') {
+        if (!validarDataFutura(msg.body)) return client.sendMessage(from, `❌ *DATA INVÁLIDA*\n\nDigite uma data futura válida (ex: 25/03)`);
+        user.data = msg.body;
+        const disp = getHorariosDisponiveis(user.data, user.profissional.nome, user.servico.duracao);
+        user.horariosDisponiveis = disp;
+        user.etapa = 'reagendar_hora';
+        salvarEstado();
+        if (!disp.length) return client.sendMessage(from, `❌ Nenhum horário disponível em ${user.data} para ${user.profissional.nome}.\n\nTente outra data:`);
+        return client.sendMessage(from,
+`⏰ *HORÁRIOS DISPONÍVEIS*
+
+━━━━━━━━━━━━━━━━━━
+
+${disp.map(h => `🕒 ${h}`).join('\n')}
+
+━━━━━━━━━━━━━━━━━━
+
+Digite o horário desejado`);
+    }
+
+    // FLUXO: REAGENDAR — HORA
+    if (user.etapa === 'reagendar_hora') {
+        if (!user.horariosDisponiveis.includes(msg.body)) return client.sendMessage(from, '❌ Horário inválido. Escolha um da lista.');
+        const agAntigo = user.agendamentoParaReagendar;
+        const novaLista = lista.filter(a => !(a.cliente === agAntigo.cliente && a.data === agAntigo.data && a.hora === agAntigo.hora));
+        const novoAg = { cliente: from, nome: user.nome, profissional: user.profissional.nome, servico: user.servico.nome, data: user.data, hora: msg.body };
+        novaLista.push(novoAg);
+        salvarAgendamentos(novaLista);
+        await enviarNotificacao("novo", { nome: user.nome, telefone: from.replace('@c.us', ''), profissional: user.profissional.nome, servico: user.servico.nome, data: user.data, hora: msg.body });
+        const { nome, servico, data } = user;
+        const hora = msg.body;
+        delete usuarios[from];
+        usuarios[from] = {};
+        salvarEstado();
+        return client.sendMessage(from,
+`✅ *REAGENDAMENTO CONFIRMADO!*
+
+━━━━━━━━━━━━━━━━━━
+
+💈 *Barbearia do Kauan*
+
+👤 ${nome}
+💇 ${servico.nome}
+
+📅 *${data}*
+⏰ *${hora}*
+
+━━━━━━━━━━━━━━━━━━
+
+🔥 Seu horário está garantido!
+💜 Te esperamos!`);
+    }
+
+    // REAGENDAR - HORA
+    // ... (already exists)
+
+    // RESPOSTA À PESQUISA DE SATISFAÇÃO
+    if (!user.etapa && (texto === '1' || texto === '2' || texto === '3' || texto === '4' || texto === '5')) {
+        const nota = parseInt(texto);
+        if (nota <= 2) {
+            await client.sendMessage(from, `😔 Sinto muito que sua experiência não tenha sido boa. Um de nossos gestores entrará em contato para entender o que houve.`);
+            await enviarNotificacao("critica", { 
+                nome: user.nomeWhatsApp || user.nome, 
+                telefone: from.replace('@c.us', ''), 
+                nota 
+            });
+        } else if (nota >= 4) {
+            await client.sendMessage(from, `🤩 Ficamos muito felizes que você tenha gostado! Te esperamos na próxima! 🔥`);
+        } else {
+            await client.sendMessage(from, `Obrigado pelo seu feedback! Vamos trabalhar para melhorar cada vez mais. 👊`);
+        }
+        return;
+    }
+
+    // IA (sem etapa)
+    if (!user.etapa && texto !== 'menu') {
+        if (!user.jaFalou) {
+            user.jaFalou = true;
+            salvarEstado();
+            return client.sendMessage(from,
+`Olá, *${user.nomeWhatsApp}*! Bem-vindo à *Barbearia do Kauan* 💈✨
+
+Quer dar aquele tapa no visual e elevar sua autoestima hoje? ✂️🔥
+Nossa equipe está pronta para te proporcionar a melhor experiência!
+
+⚡ *Ainda temos alguns horários disponíveis!* Não deixe para depois.
+
+👉 Digite *menu* para ver nossos serviços e agendar agora mesmo! 👇
+🙋‍♂️ Ou digite *Quero falar com um humano* se preferir.`);
+        }
+        if (texto.includes("preço") || texto.includes("valor") || texto.includes("quanto")) {
+            return client.sendMessage(from, 
+`💰 *Confira nossos serviços e valores exclusivos:*
+
+${services.map(s => `✨ *${s.nome}*: R$${s.preco} (aprox. ${s.duracao}min)`).join('\n')}
+
+Investir em você é o melhor investmento! 🚀
+👉 Digite *menu* para garantir seu horário agora.
+🙋‍♂️ Ou digite *Quero falar com um humano*`);
+        }
+
+        if (texto.includes("onde fica") || texto.includes("localização") || texto.includes("endereço")) {
+            return client.sendMessage(from, `📍 *NOSSA LOCALIZAÇÃO*\n\n🏠 ${ENDERECO_BARBEARIA}\n\n🗺 *Google Maps:* ${LINK_MAPS}\n\n👉 Digite *menu* para agendar`);
+        }
+
+        if (texto.includes("horário") || texto.includes("funcionamento") || texto.includes("que horas abre")) {
+            return client.sendMessage(from, `${HORARIO_FUNCIONAMENTO}\n\n👉 Digite *menu* para agendar`);
+        }
+
+        if (texto === "fidelidade" || texto === "meus pontos" || texto === "cartão fidelidade") {
+            const user = usuarios[from] || {};
+            const pontos = user.pontosFidelidade || 0;
+            const faltam = PONTOS_PARA_PREMIO - pontos;
+
+            let msg = `🏆 *PROGRAMA DE FIDELIDADE*\n\n`;
+            msg += `Olá, *${user.nomeWhatsApp}*!\n\n`;
+            msg += `📊 *Seu Cartão Digital:*\n`;
+            msg += `[${'■'.repeat(pontos % PONTOS_PARA_PREMIO)}${'□'.repeat(Math.max(0, faltam))}]\n\n`;
+            msg += `Cortes realizados: *${pontos}*\n`;
+
+            if (pontos >= PONTOS_PARA_PREMIO) {
+                msg += `🎉 *VOCÊ TEM UM CORTE GRÁTIS!* 🎉\n\nFale com um barbeiro na sua próxima visita para resgatar seu prêmio!`;
+            } else {
+                msg += `Faltam apenas *${faltam}* cortes para você ganhar um corte totalmente grátis! ✂️🎁`;
+            }
+            return client.sendMessage(from, msg);
+        }
+
+        if (texto === "indicar" || texto === "convidar" || texto === "ganhar pontos") {
+            return client.sendMessage(from, 
+`📢 *INDIQUE E GANHE!* 🎁
+
+Gostou do nosso serviço? Indique para um amigo e ganhe benefícios!
+
+Ao completar seu cartão fidelidade (10 cortes), você ganha 1 corte grátis. Compartilhe o link abaixo com seus amigos para eles agendarem também:
+
+👉 ${LINK_AGENDAMENTO}
+
+Barbearia do Kauan: Estilo e Qualidade! ✂️🔥`);
+        }
+
+        return client.sendMessage(from,
+`🤖 *Atendimento Inteligente - Barbearia do Kauan*
+
+Para facilitar sua vida, use os comandos abaixo:
+
+🔹 Digite *menu* para agendar seu horário
+🔹 Digite *meus agendamentos* para gerenciar seus horários
+🔹 Digite *fidelidade* para ver seus pontos e prêmios 🏆
+🔹 Digite *indicar* para ganhar benefícios 🎁
+🔹 Digite *localização* para saber onde estamos
+🔹 Digite *horário* para ver quando abrimos
+🙋‍♂️ Ou digite *Quero falar com um humano* para falar comigo!`);
+    }
+
+    // MENU
+    if (texto === 'menu') {
+        let menu = `💈 *ESCOLHA SEU ESTILO - BARBEARIA DO KAUAN*\n\n`;
+        menu += `Olá, *${user.nomeWhatsApp}*! Vamos agendar seu momento de cuidado?\n\n`;
+        menu += `━━━━━━━━━━━━━━━━━━\n`;
+        menu += `👨‍🔧 *Selecione o Profissional:*\n\n`;
+        profissionais.forEach(p => { menu += `🔹 *${p.id}* • ${p.nome}\n`; });
+        menu += `\n━━━━━━━━━━━━━━━━━━\n\n`;
+        menu += `📋 *meus agendamentos* — Ver meus horários\n`;
+        menu += `🏆 *fidelidade* — Meus pontos\n`;
+        menu += `📢 *indicar* — Ganhar benefícios\n`;
+        menu += `🙋‍♂️ *Quero falar com um humano*\n`;
+        menu += `❌ *cancelar* — Sair do atendimento`;
+        user.etapa = 'profissional';
+        salvarEstado();
+        return client.sendMessage(from, menu);
+    }
+
+    if (!user.etapa) return;
+
+    // PROFISSIONAL
+    if (user.etapa === 'profissional') {
+        const prof = profissionais.find(p => p.id == msg.body);
+        if (!prof) return client.sendMessage(from, "❌ *Opção inválida!* Escolha um número da lista acima.");
+        user.profissional = prof;
+        user.etapa = 'servico';
+        let txt = `💇 *QUAL SERVIÇO VAMOS REALIZAR HOJE?*\n\n━━━━━━━━━━━━━━━━━━\n\n`;
+        services.forEach(s => { txt += `✂️ *${s.id}* • ${s.nome}\n💰 R$${s.preco} | ⏱ ${s.duracao}min\n\n`; });
+        txt += `━━━━━━━━━━━━━━━━━━\nDigite o número do serviço desejado:`;
+        salvarEstado();
+        return client.sendMessage(from, txt);
+    }
+
+    // SERVIÇO
+    if (user.etapa === 'servico') {
+        const serv = services.find(s => s.id == msg.body);
+        if (!serv) return client.sendMessage(from, "❌ *Opção inválida!* Escolha o número do serviço da lista.");
+        user.servico = serv;
+        user.etapa = 'nome';
+        salvarEstado();
+        return client.sendMessage(from, `👤 *IDENTIFICAÇÃO*\n\nExcelente escolha! Agora, como devemos te chamar no dia do atendimento?`);
+    }
+
+    // NOME
+    if (user.etapa === 'nome') {
+        user.nome = msg.body;
+        user.etapa = 'data';
+        salvarEstado();
+        return client.sendMessage(from, `📅 *QUANDO VAMOS TE VER?*\n\nQual o melhor dia para você vir à barbearia? (ex: 25/03)`);
+    }
+
+    // DATA
+    if (user.etapa === 'data') {
+        if (!validarDataFutura(msg.body)) return client.sendMessage(from, `❌ *DATA INVÁLIDA OU EXPIRADA*\n\nDigite uma data futura válida`);
+        user.data = msg.body;
+        const disp = getHorariosDisponiveis(user.data, user.profissional.nome, user.servico.duracao);
+        user.horariosDisponiveis = disp;
+        user.etapa = 'hora';
+        salvarEstado();
+        if (!disp.length) return client.sendMessage(from, `❌ Nenhum horário disponível em ${user.data} para ${user.profissional.nome}.\n\nTente outra data:`);
+        return client.sendMessage(from,
+`⏰ *HORÁRIOS DISPONÍVEIS*
+
+━━━━━━━━━━━━━━━━━━
+
+${disp.map(h => `🕒 ${h}`).join('\n')}
+
+━━━━━━━━━━━━━━━━━━
+
+Digite o horário desejado`);
+    }
+
+    // HORA
+    if (user.etapa === 'hora') {
+        if (!user.horariosDisponiveis.includes(msg.body)) return client.sendMessage(from, "❌ Horário inválido. Escolha um da lista.");
+        user.hora = msg.body;
+        user.etapa = 'confirmar';
+        salvarEstado();
+        return client.sendMessage(from,
+`📋 *CONFIRMAÇÃO DO AGENDAMENTO*
+
+━━━━━━━━━━━━━━━━━━
+
+👤 *Cliente:* ${user.nome}
+👨‍🔧 *Profissional:* ${user.profissional.nome}
+💇 *Serviço:* ${user.servico.nome}
+⏱ *Duração:* ${user.servico.duracao}min
+💰 *Valor:* R$${user.servico.preco}
+
+📅 *Data:* ${user.data}
+⏰ *Horário:* ${user.hora}
+
+━━━━━━━━━━━━━━━━━━
+
+1️⃣ *Confirmar agendamento*  
+2️⃣ *Cancelar*`);
+    }
+
+    // CONFIRMAR
+    if (user.etapa === 'confirmar') {
+        if (msg.body !== '1') {
+            delete usuarios[from];
+            usuarios[from] = {};
+            salvarEstado();
+            return client.sendMessage(from, "❌ Cancelado\n\nDigite *menu* para recomeçar.");
+        }
+        lista.push({ cliente: from, nome: user.nome, profissional: user.profissional.nome, servico: user.servico.nome, data: user.data, hora: user.hora });
+        salvarAgendamentos(lista);
+        await enviarNotificacao("novo", { nome: user.nome, telefone: from.replace('@c.us', ''), profissional: user.profissional.nome, servico: user.servico.nome, data: user.data, hora: user.hora });
+        const { nome, servico, data, hora } = user;
+        delete usuarios[from];
+        usuarios[from] = {};
+        salvarEstado();
+        return client.sendMessage(from,
+`✅ *AGENDAMENTO CONFIRMADO!*
+
+━━━━━━━━━━━━━━━━━━
+
+💈 *Barbearia do Kauan*
+
+👤 ${nome}
+💇 ${servico.nome}
+
+📅 *${data}*
+⏰ *${hora}*
+
+━━━━━━━━━━━━━━━━━━
+
+🔥 Seu horário está garantido!
+⏰ Chegue 5 min antes
+💜 Te esperamos!`);
+    }
+});
+
+client.on('qr', qr => qrcode.generate(qr, { small: true }));
+client.on('ready', () => console.log("🔥 Bot pronto"));
+client.initialize();

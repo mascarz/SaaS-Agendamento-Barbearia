@@ -1,0 +1,19 @@
+[
+  {
+    "id": 1775319232990,
+    "data": "04/04/2026, 13:13:52",
+    "status": "Pendente",
+    "cliente": "cliente",
+    "itens": [
+      {
+        "id": 1,
+        "nome": "Pomada Modeladora Efeito Matte",
+        "preco": 45,
+        "categoria": "Pomada",
+        "imagem": "https://via.placeholder.com/150",
+        "estoque": 10
+      }
+    ],
+    "total": 45
+  }
+]

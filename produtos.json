@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "nome": "Pomada Modeladora Efeito Matte",
+    "preco": 45,
+    "categoria": "Pomada",
+    "imagem": "https://via.placeholder.com/150",
+    "estoque": 10
+  },
+  {
+    "id": 2,
+    "nome": "Shampoo para Barba",
+    "preco": 35,
+    "categoria": "Shampoo",
+    "imagem": "https://via.placeholder.com/150",
+    "estoque": 15
+  },
+  {
+    "id": 3,
+    "nome": "Óleo Hidratante Premium",
+    "preco": 50,
+    "categoria": "Óleo",
+    "imagem": "https://via.placeholder.com/150",
+    "estoque": 8
+  }
+]
